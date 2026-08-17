@@ -5,8 +5,10 @@
 //     → このサーバーの /webhook にWebhookイベントが届く
 //     → 署名を検証
 //     → 既読をつける（markAsReadToken を使用。反応する/しないに関わらず必ず実行）
-//     → 「@エリオット宛てのメンション」または「エリオット自身のメッセージへのリプライ（引用返信）」
-//       のときだけ、OpenAI APIに投げて返信を生成する（それ以外は既読だけつけて無反応）
+//     → 「本文に『エリオット』という文字が含まれる」または「エリオット自身のメッセージへの
+//       リプライ（引用返信）」のときだけ、OpenAI APIに投げて返信を生成する
+//       （それ以外は既読だけつけて無反応。LINEの@メンション機能はグループによって候補に
+//       出てこないなど不安定なため、文字列一致方式に変更）
 //     → LINEの reply API で返信を送信し、送ったメッセージIDを覚えておく
 //       （次に届くリプライが「エリオット宛てか」を判定するため）
 //
@@ -173,13 +175,14 @@ async function handleEvent(event) {
 
 async function handleTextMessage(event) {
   const text = event.message.text;
-  const mention = event.message.mention;
   const convId = getConversationId(event);
 
-  // 反応するのは「エリオット宛てのメンション」か「エリオットのメッセージへのリプライ」のときだけ
-  const addressedToBot = isAddressedToSelf(mention);
+  // 反応するのは「本文に『エリオット』という文字が含まれる」か
+  // 「エリオットのメッセージへのリプライ」のときだけ
+  // （LINEの@メンション機能は、グループによっては候補に出ないなど不安定なため使わない）
+  const mentionsName = containsBotName(text);
   const replyingToBot = isReplyToBot(convId, event.message.quotedMessageId);
-  if (!addressedToBot && !replyingToBot) {
+  if (!mentionsName && !replyingToBot) {
     return; // 既読はつけるが、返信はしない
   }
 
@@ -211,12 +214,9 @@ async function handleImageMessage(event) {
   rememberBotMessageIds(convId, sent?.sentMessages);
 }
 
-// 「@エリオット」または「全員宛て（@全員）」のメンションを受けている場合に true
-function isAddressedToSelf(mention) {
-  if (!mention || !Array.isArray(mention.mentionees) || mention.mentionees.length === 0) {
-    return false; // メンションなし → エリオット宛てとはみなさない
-  }
-  return mention.mentionees.some((m) => m.isSelf === true || m.type === 'all');
+// 本文に「エリオット」という文字列が含まれているか（「岡部エリオット」も含む）
+function containsBotName(text) {
+  return typeof text === 'string' && text.includes('エリオット');
 }
 
 function getConversationId(event) {
