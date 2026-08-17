@@ -4,14 +4,16 @@
 //   LINEの公式アカウントがメッセージを受け取る
 //     → このサーバーの /webhook にWebhookイベントが届く
 //     → 署名を検証
-//     → 既読をつける（markAsReadToken を使用）
-//     → 他の人宛てのメンション（@自分以外）なら、そこで処理終了（返信しない）
-//     → それ以外（自分宛て or メンションなし）なら、OpenAI APIに投げて返信を生成
-//     → LINEの reply API で返信を送信
+//     → 既読をつける（markAsReadToken を使用。反応する/しないに関わらず必ず実行）
+//     → 「@エリオット宛てのメンション」または「エリオット自身のメッセージへのリプライ（引用返信）」
+//       のときだけ、OpenAI APIに投げて返信を生成する（それ以外は既読だけつけて無反応）
+//     → LINEの reply API で返信を送信し、送ったメッセージIDを覚えておく
+//       （次に届くリプライが「エリオット宛てか」を判定するため）
 //
-// 会話履歴（メモリ）はサーバーのメモリ上に保持しています。サーバーが再起動すると
-// リセットされる点にご注意ください（Renderの無料枠は一定時間アクセスがないと
-// スリープ→次のアクセスで再起動、というサイクルになります）。
+// 会話履歴（メモリ）・時刻情報・リプライ判定用のメッセージIDは、いずれもサーバーの
+// メモリ上に保持しています。サーバーが再起動するとリセットされる点にご注意ください
+// （Renderの無料枠は一定時間アクセスがないとスリープ→次のアクセスで再起動、という
+// サイクルになります）。
 
 require('dotenv').config();
 const express = require('express');
@@ -38,6 +40,76 @@ const SYSTEM_PROMPT = `あなたは岡部エリオットという名前の、LIN
 
 const MEMORY_WINDOW = 10; // 直近何往復ぶん覚えておくか（Dify側の設定と同じ）
 const conversations = new Map(); // key: groupId/userId → OpenAI messages配列
+const lastMessageAt = new Map(); // key: groupId/userId → 直前のメッセージ時刻（Dateオブジェクト）
+const botMessageIds = new Map(); // key: groupId/userId → エリオット自身が送った直近のメッセージID集合（Set）
+
+// エリオットが送ったメッセージのIDを覚えておく（「リプライ」判定に使う）
+function rememberBotMessageIds(convId, sentMessages) {
+  if (!Array.isArray(sentMessages)) return;
+  const ids = botMessageIds.get(convId) || new Set();
+  for (const m of sentMessages) {
+    if (m?.id) ids.add(m.id);
+  }
+  // 際限なく増えないよう、直近50件程度に丸める
+  while (ids.size > 50) {
+    ids.delete(ids.values().next().value);
+  }
+  botMessageIds.set(convId, ids);
+}
+
+// 受信したメッセージが「エリオット自身の過去メッセージへのリプライ（引用返信）」かどうか
+function isReplyToBot(convId, quotedMessageId) {
+  if (!quotedMessageId) return false;
+  const ids = botMessageIds.get(convId);
+  return !!ids && ids.has(quotedMessageId);
+}
+
+// 現在時刻を「2026年8月17日(月) 14:30」のような日本語表記にする
+function formatJstNow(date) {
+  const parts = new Intl.DateTimeFormat('ja-JP', {
+    timeZone: 'Asia/Tokyo',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+
+  const get = (type) => parts.find((p) => p.type === type)?.value || '';
+  return `${get('year')}年${get('month')}月${get('day')}日(${get('weekday')}) ${get('hour')}:${get(
+    'minute'
+  )}`;
+}
+
+// 経過時間を「約3時間ぶり」のような日本語表現にする（直近すぎる場合はnull）
+function describeGap(ms) {
+  const minutes = ms / 60000;
+  if (minutes < 15) return null;
+  const hours = minutes / 60;
+  if (hours < 1) return `約${Math.round(minutes)}分ぶり`;
+  const days = hours / 24;
+  if (days < 1) return `約${Math.round(hours)}時間ぶり`;
+  if (days < 14) return `約${Math.round(days)}日ぶり`;
+  return `約${Math.round(days / 7)}週間ぶり`;
+}
+
+// システムプロンプトに付け足す「時間の文脈」を組み立てる
+function buildTimeContext(convId, now) {
+  let context = `現在の日時は${formatJstNow(
+    now
+  )}です。時間帯（朝・昼・夜など）に応じた挨拶や話し方を、不自然にならない範囲で意識してください。`;
+
+  const last = lastMessageAt.get(convId);
+  if (last) {
+    const gapDesc = describeGap(now - last);
+    if (gapDesc) {
+      context += `\nこの相手との前回のやり取りから${gapDesc}経っています。時間が空いたことに軽く触れても構いませんが、毎回大げさに反応する必要はありません。`;
+    }
+  }
+  return context;
+}
 
 const app = express();
 
@@ -102,42 +174,49 @@ async function handleEvent(event) {
 async function handleTextMessage(event) {
   const text = event.message.text;
   const mention = event.message.mention;
+  const convId = getConversationId(event);
 
-  if (isMentionToSomeoneElse(mention)) {
-    // 自分以外の誰かへのメンション → 既読はつけるが返信はしない
-    return;
+  // 反応するのは「エリオット宛てのメンション」か「エリオットのメッセージへのリプライ」のときだけ
+  const addressedToBot = isAddressedToSelf(mention);
+  const replyingToBot = isReplyToBot(convId, event.message.quotedMessageId);
+  if (!addressedToBot && !replyingToBot) {
+    return; // 既読はつけるが、返信はしない
   }
 
-  const convId = getConversationId(event);
   const reply = await askOpenAI(convId, { role: 'user', content: text });
-  await replyText(event.replyToken, reply);
+  const sent = await sendReply(event.replyToken, reply);
+  rememberBotMessageIds(convId, sent?.sentMessages);
 }
 
 async function handleImageMessage(event) {
+  const convId = getConversationId(event);
+
+  // 画像には@メンションの概念がないので、エリオットのメッセージへのリプライのときだけ反応する
+  if (!isReplyToBot(convId, event.message.quotedMessageId)) {
+    return;
+  }
+
   // 画像はLINEのcontent APIからダウンロードしてBase64化し、
   // Vision対応モデルにそのまま渡す
   const messageId = event.message.id;
   const imageBase64 = await downloadLineContent(messageId);
 
-  const convId = getConversationId(event);
   const userContent = [
     { type: 'text', text: '（画像が送られてきました。内容を見て、自然に反応してください）' },
     { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
   ];
 
   const reply = await askOpenAI(convId, { role: 'user', content: userContent });
-  await replyText(event.replyToken, reply);
+  const sent = await sendReply(event.replyToken, reply);
+  rememberBotMessageIds(convId, sent?.sentMessages);
 }
 
-// 「@ で誰かがメンションされていて、かつ自分（Bot）はメンションされていない」場合に true
-function isMentionToSomeoneElse(mention) {
+// 「@エリオット」または「全員宛て（@全員）」のメンションを受けている場合に true
+function isAddressedToSelf(mention) {
   if (!mention || !Array.isArray(mention.mentionees) || mention.mentionees.length === 0) {
-    return false; // メンションなし → 通常どおり反応する
+    return false; // メンションなし → エリオット宛てとはみなさない
   }
-  const mentionsSelf = mention.mentionees.some((m) => m.isSelf === true);
-  const mentionsAll = mention.mentionees.some((m) => m.type === 'all');
-  if (mentionsSelf || mentionsAll) return false; // 自分宛て or 全員宛て → 反応する
-  return true; // 自分以外の特定の誰か宛て → 反応しない
+  return mention.mentionees.some((m) => m.isSelf === true || m.type === 'all');
 }
 
 function getConversationId(event) {
@@ -145,8 +224,14 @@ function getConversationId(event) {
 }
 
 async function askOpenAI(convId, userMessage) {
+  const now = new Date();
   const history = conversations.get(convId) || [];
-  const messages = [{ role: 'system', content: SYSTEM_PROMPT }, ...history, userMessage];
+  const timeContext = buildTimeContext(convId, now);
+  const messages = [
+    { role: 'system', content: `${SYSTEM_PROMPT}\n\n${timeContext}` },
+    ...history,
+    userMessage,
+  ];
 
   const { data } = await axios.post(
     'https://api.openai.com/v1/chat/completions',
@@ -169,12 +254,13 @@ async function askOpenAI(convId, userMessage) {
     -MEMORY_WINDOW * 2
   );
   conversations.set(convId, newHistory);
+  lastMessageAt.set(convId, now);
 
   return replyText;
 }
 
-async function replyText(replyToken, text) {
-  await axios.post(
+async function sendReply(replyToken, text) {
+  const { data } = await axios.post(
     'https://api.line.me/v2/bot/message/reply',
     {
       replyToken,
@@ -188,6 +274,7 @@ async function replyText(replyToken, text) {
       timeout: 15000,
     }
   );
+  return data; // { sentMessages: [{ id, quoteToken }, ...] }
 }
 
 async function markAsRead(markAsReadToken) {
