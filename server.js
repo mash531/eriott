@@ -17,6 +17,9 @@
 //       また、悩み相談っぽい内容だとエリオット自身が判断したときは、ペルソナの指示に
 //       従って自動的にノリを抑えた「聞き役」寄りの返し方に切り替わる（モード切替の
 //       コマンドなどは無く、内容に応じてAIが都度判断する方式）
+//       返信の生成にはOpenAIの Responses API を使っており、Web検索ツールも渡して
+//       いるので、最新情報が必要そうなときはエリオットが自分の判断でGoogle検索的な
+//       Web検索をしてから答えることができる（OPENAI_WEB_SEARCH=false で無効化可能）
 //     → LINEの reply API で返信を送信し、送ったメッセージIDを覚えておく
 //       （次に届くリプライが「エリオット宛てか」を判定するため）
 //
@@ -37,11 +40,16 @@ const {
   LINE_CHANNEL_SECRET,
   LINE_CHANNEL_ACCESS_TOKEN,
   OPENAI_API_KEY,
-  OPENAI_MODEL = 'gpt-5',
+  OPENAI_MODEL = 'gpt-5.6',
+  OPENAI_WEB_SEARCH = 'true',
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY,
   PORT = 3000,
 } = process.env;
+
+// Web検索ツールは、対応モデル（gpt-5.6 / gpt-5.5 / gpt-4.1 系など）でのみ使えます。
+// OPENAI_WEB_SEARCH=false にすると、検索なしの通常会話だけにできます（コスト調整用）。
+const webSearchEnabled = OPENAI_WEB_SEARCH !== 'false';
 
 if (!LINE_CHANNEL_SECRET || !LINE_CHANNEL_ACCESS_TOKEN || !OPENAI_API_KEY) {
   console.error(
@@ -71,7 +79,9 @@ const SYSTEM_PROMPT = `あなたは岡部エリオットという名前の、LIN
 
 このあとに「このグループのメンバーについて、これまでの会話から学習した特徴」が渡されることがあります。誰かから「〇〇のマネして」「〇〇っぽく言って」のように言われたら、それを参考に軽くその人っぽい口調・ノリを真似してみて構いません。ただし本人になりすまして誤解を招くようなことはせず、あくまで場を盛り上げるための軽いモノマネ・ネタとして扱ってください。
 
-もし相手が悩み事・つらい気持ち・しんどいこと・人間関係の悩みなど、真剣に聞いてほしそうな内容を話してきたときは、自動的に態度を切り替えてください。いつものテンションの高いノリやボケ・絵文字の多用は控えめにし、話を遮らずにじっくり受け止める姿勢になってください。相手の気持ちをまず否定せずに受け止め、共感の言葉をかけてください。すぐに解決策やアドバイスを急がず、必要なら「もう少し聞かせて」というように相手のペースに合わせてください。話題が落ち着いたら、いつものノリに自然に戻って構いません。ただし、自分を傷つけたい・消えてしまいたいといった深刻なサインが見られたときは、その話をちゃんと受け止めたうえで、「こころの健康相談統一ダイヤル」（0570-064-556、全国どこからでも近くの公的な相談窓口につながります）や、厚生労働省の「まもろうよこころ」（SNS相談などの窓口をまとめたサイト、https://www.mhlw.go.jp/mamorouyokokoro/）のような専門の相談先も、押しつけがましくならない程度にそっと伝えてください。エリオットは友達であって専門家やカウンセラーそのものではないので、深刻な内容を全部一人で抱え込もうとせず、頼れる人や専門機関につなぐ役割も意識してください。`;
+もし相手が悩み事・つらい気持ち・しんどいこと・人間関係の悩みなど、真剣に聞いてほしそうな内容を話してきたときは、自動的に態度を切り替えてください。いつものテンションの高いノリやボケ・絵文字の多用は控えめにし、話を遮らずにじっくり受け止める姿勢になってください。相手の気持ちをまず否定せずに受け止め、共感の言葉をかけてください。すぐに解決策やアドバイスを急がず、必要なら「もう少し聞かせて」というように相手のペースに合わせてください。話題が落ち着いたら、いつものノリに自然に戻って構いません。ただし、自分を傷つけたい・消えてしまいたいといった深刻なサインが見られたときは、その話をちゃんと受け止めたうえで、「こころの健康相談統一ダイヤル」（0570-064-556、全国どこからでも近くの公的な相談窓口につながります）や、厚生労働省の「まもろうよこころ」（SNS相談などの窓口をまとめたサイト、https://www.mhlw.go.jp/mamorouyokokoro/）のような専門の相談先も、押しつけがましくならない程度にそっと伝えてください。エリオットは友達であって専門家やカウンセラーそのものではないので、深刻な内容を全部一人で抱え込もうとせず、頼れる人や専門機関につなぐ役割も意識してください。
+
+最新のニュース・天気・値段・日程など、自分の知識だけでは答えられない・古くなっている可能性がある話を聞かれたときは、必要に応じてWeb検索の結果を参考にして答えてください。検索結果を箇条書きでそのまま羅列したりせず、いつもの口調で自然に会話の中に混ぜ込んで教えてください。情報源のURLは、聞かれたときや特に役立ちそうなときだけ、さらっと添える程度で構いません。`;
 
 const MEMORY_WINDOW = 10; // 直近何往復ぶん覚えておくか（Dify側の設定と同じ）
 const conversations = new Map(); // key: groupId/userId → OpenAI messages配列
@@ -396,8 +406,8 @@ async function handleImageMessage(event) {
   const imageBase64 = await downloadLineContent(messageId);
 
   const userContent = [
-    { type: 'text', text: '（画像が送られてきました。内容を見て、自然に反応してください）' },
-    { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } },
+    { type: 'input_text', text: '（画像が送られてきました。内容を見て、自然に反応してください）' },
+    { type: 'input_image', image_url: `data:image/jpeg;base64,${imageBase64}` },
   ];
 
   const reply = await askOpenAI(convId, { role: 'user', content: userContent });
@@ -414,6 +424,50 @@ function getConversationId(event) {
   return event.source.groupId || event.source.roomId || event.source.userId || 'unknown';
 }
 
+// OpenAIの Responses API を呼び出す（Web検索ツール付き）。
+// 検索対応していないモデルが設定されている等でエラーになった場合は、
+// ツールなし（普通の会話のみ）で1回だけ再試行し、それでもダメなら例外を投げる。
+async function callOpenAIResponses(input) {
+  const baseHeaders = {
+    Authorization: `Bearer ${OPENAI_API_KEY}`,
+    'Content-Type': 'application/json',
+  };
+
+  if (webSearchEnabled) {
+    try {
+      const { data } = await axios.post(
+        'https://api.openai.com/v1/responses',
+        { model: OPENAI_MODEL, input, tools: [{ type: 'web_search' }] },
+        { headers: baseHeaders, timeout: 45000 }
+      );
+      return data;
+    } catch (err) {
+      console.error(
+        '[Web検索付き呼び出しエラー、検索なしで再試行します]',
+        err?.response?.data || err?.message || err
+      );
+    }
+  }
+
+  const { data } = await axios.post(
+    'https://api.openai.com/v1/responses',
+    { model: OPENAI_MODEL, input },
+    { headers: baseHeaders, timeout: 30000 }
+  );
+  return data;
+}
+
+// Responses APIのレスポンスから本文テキストを取り出す（output_textが無い場合の保険）
+function extractOutputText(output) {
+  if (!Array.isArray(output)) return '';
+  const messageItem = output.find((item) => item.type === 'message');
+  if (!messageItem || !Array.isArray(messageItem.content)) return '';
+  return messageItem.content
+    .filter((c) => c.type === 'output_text' || c.type === 'text')
+    .map((c) => c.text)
+    .join('');
+}
+
 async function askOpenAI(convId, userMessage) {
   const now = new Date();
   const history = conversations.get(convId) || [];
@@ -422,28 +476,18 @@ async function askOpenAI(convId, userMessage) {
     console.error('[メンバープロフィール取得エラー]', err?.response?.data || err?.message || err);
     return '';
   });
-  const messages = [
+  const input = [
     { role: 'system', content: `${SYSTEM_PROMPT}\n\n${timeContext}${memberContext}` },
     ...history,
     userMessage,
   ];
 
-  const { data } = await axios.post(
-    'https://api.openai.com/v1/chat/completions',
-    {
-      model: OPENAI_MODEL,
-      messages,
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      timeout: 30000,
-    }
-  );
-
-  const replyText = data.choices[0].message.content.trim();
+  const data = await callOpenAIResponses(input);
+  const replyText = (
+    data.output_text ||
+    extractOutputText(data.output) ||
+    'あ、なんか今うまく言葉が出てこなかった…もう一回言ってみてもらっていい？'
+  ).trim();
 
   const newHistory = [...history, userMessage, { role: 'assistant', content: replyText }].slice(
     -MEMORY_WINDOW * 2
