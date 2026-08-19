@@ -441,8 +441,13 @@ async function handleImageMessage(event) {
 }
 
 // 本文に「エリオット」という文字列が含まれているか（「岡部エリオット」も含む）
+// ひらがな表記（「えりおっと」等）にも反応できるよう、判定前にひらがなをカタカナに変換してから比較する
 function containsBotName(text) {
-  return typeof text === 'string' && text.includes('エリオット');
+  if (typeof text !== 'string') return false;
+  const normalized = text.replace(/[ぁ-ゖ]/g, (ch) =>
+    String.fromCharCode(ch.charCodeAt(0) + 0x60)
+  );
+  return normalized.includes('エリオット');
 }
 
 function getConversationId(event) {
