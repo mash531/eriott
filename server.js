@@ -9,9 +9,13 @@
 //       発言を記録。一定件数たまるごとにOpenAIでその人の話し方・キャラクターの
 //       特徴を要約し直し、プロフィールとして保存する（反応する/しないに関わらず実行）
 //     → 「本文に『エリオット』という文字が含まれる」または「エリオット自身のメッセージへの
-//       リプライ（引用返信）」のときだけ、OpenAI APIに投げて返信を生成する
+//       リプライ（引用返信）」または「会話セッション中（直近の反応から3分以内）」のときだけ、
+//       OpenAI APIに投げて返信を生成する
 //       （それ以外は既読だけつけて無反応。LINEの@メンション機能はグループによって候補に
 //       出てこないなど不安定なため、文字列一致方式に変更）
+//       会話セッションは、名前で呼びかけられて反応するたびに3分間延長される。名前なしで
+//       話しかけても、直近3分以内にエリオットが反応していればそのまま会話を続けられ、
+//       しばらく反応がないと自動的に「名前を呼ぶ必要がある」状態に戻る
 //       返信を作るときは、上記のメンバープロフィールも参考情報として渡すので、
 //       「〇〇のマネして」のような話にもある程度対応できる
 //       また、悩み相談っぽい内容だとエリオット自身が判断したときは、ペルソナの指示に
@@ -88,6 +92,10 @@ const conversations = new Map(); // key: groupId/userId → OpenAI messages配�
 const lastMessageAt = new Map(); // key: groupId/userId → 直前のメッセージ時刻（Dateオブジェクト）
 const botMessageIds = new Map(); // key: groupId/userId → エリオット自身が送った直近のメッセージID集合（Set）
 const displayNameCache = new Map(); // key: `${groupId/roomId}:${userId}` → 表示名（LINE APIの呼び出し回数を減らすためのキャッシュ）
+
+// 「エリオット」と呼びかけた後、しばらくは名前なしでも会話に反応し続けるための会話セッション機能
+const SESSION_DURATION_MS = 3 * 60 * 1000; // このミリ秒だけ、名前なしでも反応し続ける（毎回の返信で延長）
+const activeSessionUntil = new Map(); // key: groupId/userId → セッションが有効な期限（timestamp・ミリ秒）
 
 // LINEの「グループ/複数人トークのメンバープロフィール取得API」等で表示名を取得する
 async function getDisplayName(event) {
@@ -262,6 +270,17 @@ function isReplyToBot(convId, quotedMessageId) {
   return !!ids && ids.has(quotedMessageId);
 }
 
+// 会話セッション（名前なし反応モード）が今有効かどうか
+function isSessionActive(convId, now) {
+  const until = activeSessionUntil.get(convId);
+  return !!until && now.getTime() < until;
+}
+
+// 会話セッションを延長する（返信するたびに呼ぶ）
+function extendSession(convId, now) {
+  activeSessionUntil.set(convId, now.getTime() + SESSION_DURATION_MS);
+}
+
 // 現在時刻を「2026年8月17日(月) 14:30」のような日本語表記にする
 function formatJstNow(date) {
   const parts = new Intl.DateTimeFormat('ja-JP', {
@@ -379,24 +398,29 @@ async function handleTextMessage(event) {
   );
 
   // 反応するのは「本文に『エリオット』という文字が含まれる」か
-  // 「エリオットのメッセージへのリプライ」のときだけ
+  // 「エリオットのメッセージへのリプライ」か「会話セッション中（直近に呼びかけがあり、まだ有効期限内）」のときだけ
   // （LINEの@メンション機能は、グループによっては候補に出ないなど不安定なため使わない）
+  const now = new Date();
   const mentionsName = containsBotName(text);
   const replyingToBot = isReplyToBot(convId, event.message.quotedMessageId);
-  if (!mentionsName && !replyingToBot) {
+  const sessionActive = isSessionActive(convId, now);
+  if (!mentionsName && !replyingToBot && !sessionActive) {
     return; // 既読はつけるが、返信はしない
   }
 
   const reply = await askOpenAI(convId, { role: 'user', content: text });
   const sent = await sendReply(event.replyToken, reply);
   rememberBotMessageIds(convId, sent?.sentMessages);
+  extendSession(convId, now); // 返信したら会話セッションを延長（しばらく名前なしでも反応し続ける）
 }
 
 async function handleImageMessage(event) {
   const convId = getConversationId(event);
 
-  // 画像には@メンションの概念がないので、エリオットのメッセージへのリプライのときだけ反応する
-  if (!isReplyToBot(convId, event.message.quotedMessageId)) {
+  // 画像には@メンションの概念がないので、
+  // 「エリオットのメッセージへのリプライ」か「会話セッション中」のときだけ反応する
+  const now = new Date();
+  if (!isReplyToBot(convId, event.message.quotedMessageId) && !isSessionActive(convId, now)) {
     return;
   }
 
@@ -413,6 +437,7 @@ async function handleImageMessage(event) {
   const reply = await askOpenAI(convId, { role: 'user', content: userContent });
   const sent = await sendReply(event.replyToken, reply);
   rememberBotMessageIds(convId, sent?.sentMessages);
+  extendSession(convId, now); // 返信したら会話セッションを延長
 }
 
 // 本文に「エリオット」という文字列が含まれているか（「岡部エリオット」も含む）
